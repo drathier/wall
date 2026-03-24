@@ -36,6 +36,11 @@ färger:
 
 
 
+Vi bygger en vägg med pärlplattor. Vi vill rösta på vilken platta som ska sättas upp varje vecka. Väggen är 27 plattor bred * 12 plattor hög med 30x30 pärlor per platta. Vi vill visa hur väggen ser ut so far, samt låta folk ladda upp bmp-filer med godkända färger som förslag på vad som ska bytas ut härnäst. Varje vecka röstar man också på vilken koordinat (x+ höger, y+ ner) som ska bytas ut nästa vecka. I början är hela väggen vit.
+
+Skriv en webbserver i rust där folk kan rösta. Vi har en db på vilka som får rösta; det lägger vi till stöd för senare. For now får alla rösta hur många gånger man vill. 
+
+First off, stöd för att ladda upp bmp, visa uppladdade, låt folk rösta, debug-knapp som säger "nu är det en ny vecka", db som sparar alla röstresultat so far, och visa hur väggen ser ut so far.
 
 1. ladda upp bilder att rösta mellan
 2. röstning + vem som får rösta
