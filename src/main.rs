@@ -29,40 +29,10 @@ const APPROVED_COLORS: &[(&str, u8, u8, u8)] = &[
     ("SVART", 0, 0, 0),
 ];
 
-const CACHE_DIR: &str = "./cache";
 const EVENTS_FILE: &str = "wall.jsonl";
 
 struct AppState {
     events_path: Mutex<String>,
-}
-
-fn ensure_cache_dir() {
-    if !Path::new(CACHE_DIR).exists() {
-        fs::create_dir_all(CACHE_DIR).expect("Failed to create cache directory");
-    }
-}
-
-fn clear_cache() {
-    ensure_cache_dir();
-    if let Ok(entries) = fs::read_dir(CACHE_DIR) {
-        for entry in entries.flatten() {
-            let _ = fs::remove_file(entry.path());
-        }
-    }
-}
-
-fn get_cached_wall_path() -> String {
-    format!("{}/wall.png", CACHE_DIR)
-}
-
-fn save_cached_wall(png_data: &[u8]) {
-    let path = get_cached_wall_path();
-    let _ = fs::write(&path, png_data);
-}
-
-fn get_cached_wall() -> Option<Vec<u8>> {
-    let path = get_cached_wall_path();
-    fs::read(&path).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -336,22 +306,50 @@ fn get_wall_tiles_for_week(events_path: &str, target_week: u32) -> HashMap<(i32,
 }
 
 fn render_wall_preview_for_week(events_path: &str, target_week: u32) -> Vec<u8> {
-    let tiles = get_wall_tiles_for_week(events_path, target_week);
+    let row_bytes = (TOTAL_WIDTH * 3) as usize;
+    let plate_row_bytes = (PLATE_SIZE * 3) as usize;
     
-    let mut pixels = vec![255u8; (TOTAL_WIDTH * TOTAL_HEIGHT * 3) as usize];
+    let colors: Vec<(u8, u8, u8)> = APPROVED_COLORS
+        .iter()
+        .map(|(_, r, g, b)| (*r, *g, *b))
+        .collect();
+    let num_colors = colors.len() as i32;
     
-    for ty in 0..WALL_HEIGHT_PLATES as i32 {
-        for tx in 0..WALL_WIDTH_PLATES as i32 {
-            if let Some(tile_data) = tiles.get(&(tx, ty)) {
-                let ty = ty as usize;
-                let tx = tx as usize;
-                let row_size = (PLATE_SIZE * 3) as usize;
-                for py in 0..PLATE_SIZE as usize {
-                    let src_offset = py * row_size;
-                    let dest_offset = ((ty * PLATE_SIZE as usize + py) * TOTAL_WIDTH as usize + (tx * PLATE_SIZE as usize)) * 3;
-                    let copy_len = row_size.min(pixels.len().saturating_sub(dest_offset));
-                    if copy_len > 0 && src_offset + copy_len <= tile_data.len() {
-                        pixels[dest_offset..dest_offset + copy_len].copy_from_slice(&tile_data[src_offset..src_offset + copy_len]);
+    let mut pixels = Vec::with_capacity((TOTAL_WIDTH * TOTAL_HEIGHT * 3) as usize);
+    for py in 0..TOTAL_HEIGHT as i32 {
+        for px in 0..TOTAL_WIDTH as i32 {
+            let tx = px / PLATE_SIZE as i32;
+            let ty = py / PLATE_SIZE as i32;
+            let color_idx = (((tx) + (ty) * 3).abs() % num_colors) as usize;
+            let (r, g, b) = colors[color_idx];
+            pixels.push(r);
+            pixels.push(g);
+            pixels.push(b);
+        }
+    }
+    
+    let week_events: Vec<WeekAdvancedEvent> = get_events_by_type::<WeekAdvancedEvent>(events_path, "week_advanced")
+        .into_iter()
+        .map(|(_, e)| e)
+        .filter(|e| e.to_week <= target_week)
+        .collect();
+    
+    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type::<ImageUploadedEvent>(events_path, "image_uploaded")
+        .into_iter()
+        .map(|(_, e)| (e.event_id.clone(), e))
+        .collect();
+    
+    for event in &week_events {
+        if event.applied_x >= 0 && event.applied_y >= 0 {
+            if let Some(img_event_id) = &event.winning_image_event_id {
+                if let Some(img_event) = image_events.get(img_event_id) {
+                    let tx = event.applied_x as usize;
+                    let ty = event.applied_y as usize;
+                    let dest_base = ty * PLATE_SIZE as usize * row_bytes + tx * PLATE_SIZE as usize * 3;
+                    for py in 0..PLATE_SIZE as usize {
+                        let src_offset = py * plate_row_bytes;
+                        let dest_offset = dest_base + py * row_bytes;
+                        pixels[dest_offset..dest_offset + plate_row_bytes].copy_from_slice(&img_event.pixel_data[src_offset..src_offset + plate_row_bytes]);
                     }
                 }
             }
@@ -375,22 +373,49 @@ fn get_coordinate_votes_for_week(events_path: &str, week: u32) -> Vec<Coordinate
 }
 
 fn render_wall_preview(events_path: &str) -> Vec<u8> {
-    let tiles = get_wall_tiles(events_path);
+    let row_bytes = (TOTAL_WIDTH * 3) as usize;
+    let plate_row_bytes = (PLATE_SIZE * 3) as usize;
     
-    let mut pixels = vec![255u8; (TOTAL_WIDTH * TOTAL_HEIGHT * 3) as usize];
+    let colors: Vec<(u8, u8, u8)> = APPROVED_COLORS
+        .iter()
+        .map(|(_, r, g, b)| (*r, *g, *b))
+        .collect();
+    let num_colors = colors.len() as i32;
     
-    for ty in 0..WALL_HEIGHT_PLATES as i32 {
-        for tx in 0..WALL_WIDTH_PLATES as i32 {
-            if let Some(tile_data) = tiles.get(&(tx, ty)) {
-                let ty = ty as usize;
-                let tx = tx as usize;
-                let row_size = (PLATE_SIZE * 3) as usize;
-                for py in 0..PLATE_SIZE as usize {
-                    let src_offset = py * row_size;
-                    let dest_offset = ((ty * PLATE_SIZE as usize + py) * TOTAL_WIDTH as usize + (tx * PLATE_SIZE as usize)) * 3;
-                    let copy_len = row_size.min(pixels.len().saturating_sub(dest_offset));
-                    if copy_len > 0 && src_offset + copy_len <= tile_data.len() {
-                        pixels[dest_offset..dest_offset + copy_len].copy_from_slice(&tile_data[src_offset..src_offset + copy_len]);
+    let mut pixels = Vec::with_capacity((TOTAL_WIDTH * TOTAL_HEIGHT * 3) as usize);
+    for py in 0..TOTAL_HEIGHT as i32 {
+        for px in 0..TOTAL_WIDTH as i32 {
+            let tx = px / PLATE_SIZE as i32;
+            let ty = py / PLATE_SIZE as i32;
+            let color_idx = (((tx) + (ty) * 3).abs() % num_colors) as usize;
+            let (r, g, b) = colors[color_idx];
+            pixels.push(r);
+            pixels.push(g);
+            pixels.push(b);
+        }
+    }
+    
+    let week_events: Vec<WeekAdvancedEvent> = get_events_by_type(events_path, "week_advanced")
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect();
+    
+    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type::<ImageUploadedEvent>(events_path, "image_uploaded")
+        .into_iter()
+        .map(|(_, e)| (e.event_id.clone(), e))
+        .collect();
+    
+    for event in &week_events {
+        if event.applied_x >= 0 && event.applied_y >= 0 {
+            if let Some(img_event_id) = &event.winning_image_event_id {
+                if let Some(img_event) = image_events.get(img_event_id) {
+                    let tx = event.applied_x as usize;
+                    let ty = event.applied_y as usize;
+                    let dest_base = ty * PLATE_SIZE as usize * row_bytes + tx * PLATE_SIZE as usize * 3;
+                    for py in 0..PLATE_SIZE as usize {
+                        let src_offset = py * plate_row_bytes;
+                        let dest_offset = dest_base + py * row_bytes;
+                        pixels[dest_offset..dest_offset + plate_row_bytes].copy_from_slice(&img_event.pixel_data[src_offset..src_offset + plate_row_bytes]);
                     }
                 }
             }
@@ -407,14 +432,7 @@ fn render_wall_preview(events_path: &str) -> Vec<u8> {
 async fn get_wall(data: web::Data<AppState>) -> impl Responder {
     let events_path = data.events_path.lock().unwrap();
     
-    let png_data = match get_cached_wall() {
-        Some(data) => data,
-        None => {
-            let data = render_wall_preview(&events_path);
-            save_cached_wall(&data);
-            data
-        }
-    };
+    let png_data = render_wall_preview(&events_path);
     let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
     
     let current_target = get_current_target(&events_path);
@@ -429,8 +447,7 @@ async fn get_wall(data: web::Data<AppState>) -> impl Responder {
             "plate_size": PLATE_SIZE,
             "total_width": TOTAL_WIDTH,
             "total_height": TOTAL_HEIGHT
-        },
-        "cached": get_cached_wall().is_some()
+        }
     });
     
     HttpResponse::Ok()
@@ -918,21 +935,17 @@ async fn get_events_by_type_endpoint(data: web::Data<AppState>, event_type: web:
 }
 
 async fn reset_and_replay(data: web::Data<AppState>) -> impl Responder {
-    clear_cache();
-    
     let events_path = data.events_path.lock().unwrap();
-    let png_data = render_wall_preview(&events_path);
-    save_cached_wall(&png_data);
+    let _png_data = render_wall_preview(&events_path);
     
     let current_week = get_current_week(&events_path);
     let current_target = get_current_target(&events_path);
     
     HttpResponse::Ok().json(serde_json::json!({
         "success": true,
-        "message": "Cache cleared and wall regenerated from events",
+        "message": "Wall regenerated from events",
         "week": current_week,
-        "current_target": current_target.map(|(x, y)| serde_json::json!({"x": x, "y": y})),
-        "cache_cleared": true
+        "current_target": current_target.map(|(x, y)| serde_json::json!({"x": x, "y": y}))
     }))
 }
 
@@ -996,9 +1009,7 @@ async fn advance_week(data: web::Data<AppState>) -> impl Responder {
 
     append_json_event(&events_path, "week_advanced", &serde_json::to_value(&event).unwrap());
 
-    clear_cache();
     let png_data = render_wall_preview(&events_path);
-    save_cached_wall(&png_data);
     let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
 
     HttpResponse::Ok().json(serde_json::json!({
@@ -1664,9 +1675,6 @@ async fn index() -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    clear_cache();
-    println!("Cache cleared on startup");
-    
     let events_path = EVENTS_FILE.to_string();
     
     println!("[DEBUG STARTUP] Dumping all events from {}...", EVENTS_FILE);
@@ -1675,10 +1683,6 @@ async fn main() -> std::io::Result<()> {
         println!("[DEBUG STARTUP] event: type={}, id={}, created_at={}", event_type, event_id, created_at);
         println!("[DEBUG STARTUP]   payload: {}", payload);
     }
-    
-    let png_data = render_wall_preview(&events_path);
-    save_cached_wall(&png_data);
-    println!("Wall regenerated from events and cached");
 
     let app_state = web::Data::new(AppState {
         events_path: Mutex::new(events_path),
