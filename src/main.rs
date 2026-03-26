@@ -1,12 +1,11 @@
 use actix_multipart::Multipart;
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use futures_util::StreamExt;
-use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::fs;
-use std::io::Cursor;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
@@ -31,9 +30,10 @@ const APPROVED_COLORS: &[(&str, u8, u8, u8)] = &[
 ];
 
 const CACHE_DIR: &str = "./cache";
+const EVENTS_FILE: &str = "wall.jsonl";
 
 struct AppState {
-    db: Mutex<Connection>,
+    events_path: Mutex<String>,
 }
 
 fn ensure_cache_dir() {
@@ -63,6 +63,96 @@ fn save_cached_wall(png_data: &[u8]) {
 fn get_cached_wall() -> Option<Vec<u8>> {
     let path = get_cached_wall_path();
     fs::read(&path).ok()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JsonLineEvent {
+    event_type: String,
+    event_id: String,
+    payload: Value,
+    created_at: String,
+}
+
+fn read_all_events(events_path: &str) -> Vec<JsonLineEvent> {
+    let mut events = Vec::new();
+    if let Ok(file) = fs::File::open(events_path) {
+        let reader = BufReader::new(file);
+        for line in reader.lines().flatten() {
+            if let Ok(event) = serde_json::from_str::<JsonLineEvent>(&line) {
+                events.push(event);
+            }
+        }
+    }
+    events
+}
+
+fn append_json_event(events_path: &str, event_type: &str, payload: &Value) -> String {
+    let event_id = Uuid::new_v4().to_string();
+    let created_at = chrono::Utc::now().to_rfc3339();
+    
+    let event = JsonLineEvent {
+        event_type: event_type.to_string(),
+        event_id: event_id.clone(),
+        payload: payload.clone(),
+        created_at,
+    };
+    
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(events_path)
+        .expect("Failed to open events file");
+    
+    let json = serde_json::to_string(&event).unwrap();
+    writeln!(file, "{}", json).expect("Failed to write event");
+    
+    event_id
+}
+
+fn get_events_by_type<T: for<'de> Deserialize<'de>>(events_path: &str, event_type: &str) -> Vec<(String, T)> {
+    println!("[DEBUG READ] get_events_by_type: type={}", event_type);
+    
+    let events = read_all_events(events_path);
+    
+    let results: Vec<(String, T)> = events
+        .into_iter()
+        .filter(|e| e.event_type == event_type)
+        .map(|e| {
+            let payload: T = serde_json::from_value(e.payload).unwrap();
+            (e.event_id, payload)
+        })
+        .collect();
+    
+    println!("[DEBUG READ] get_events_by_type: type={}, count={}", event_type, results.len());
+    results
+}
+
+fn get_all_events_json(events_path: &str) -> Vec<(String, String, Value, String)> {
+    let events = read_all_events(events_path);
+    events
+        .into_iter()
+        .map(|e| (e.event_type, e.event_id, e.payload, e.created_at))
+        .collect()
+}
+
+fn get_latest_week_advanced(events_path: &str) -> Option<WeekAdvancedEvent> {
+    let events = read_all_events(events_path);
+    events
+        .into_iter()
+        .filter(|e| e.event_type == "week_advanced")
+        .last()
+        .map(|e| serde_json::from_value(e.payload).unwrap())
+}
+
+fn get_current_week(events_path: &str) -> u32 {
+    get_latest_week_advanced(events_path)
+        .map(|e| e.to_week)
+        .unwrap_or(0)
+}
+
+fn get_current_target(events_path: &str) -> Option<(i32, i32)> {
+    get_latest_week_advanced(events_path)
+        .map(|e| (e.next_target_x, e.next_target_y))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,98 +241,7 @@ fn create_tile_from_color(color: &[u8]) -> Vec<u8> {
     tile
 }
 
-fn init_db(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_type TEXT NOT NULL,
-            event_id TEXT NOT NULL UNIQUE,
-            payload TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        )",
-        [],
-    )?;
 
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)",
-        [],
-    )?;
-
-    Ok(())
-}
-
-fn append_event<T: Serialize>(conn: &Connection, event_type: &str, payload: &T) -> rusqlite::Result<String> {
-    let event_id = Uuid::new_v4().to_string();
-    let created_at = chrono::Utc::now().to_rfc3339();
-    let payload_json = serde_json::to_string(payload).unwrap();
-    
-    println!("[DEBUG WRITE] append_event: type={}, event_id={}, payload={}", event_type, event_id, payload_json);
-    
-    conn.execute(
-        "INSERT INTO events (event_type, event_id, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
-        params![event_type, event_id, payload_json, created_at],
-    )?;
-    
-    Ok(event_id)
-}
-
-fn get_events_by_type<T: for<'de> Deserialize<'de>>(conn: &Connection, event_type: &str) -> Vec<(String, T)> {
-    println!("[DEBUG READ] get_events_by_type: type={}", event_type);
-    
-    let mut stmt = conn
-        .prepare("SELECT event_id, payload FROM events WHERE event_type = ?1 ORDER BY id ASC")
-        .unwrap();
-    
-    let results: Vec<(String, T)> = stmt.query_map([event_type], |row| {
-        let event_id: String = row.get(0)?;
-        let payload_str: String = row.get(1)?;
-        let payload: T = serde_json::from_str(&payload_str).unwrap();
-        Ok((event_id, payload))
-    })
-    .unwrap()
-    .filter_map(|r| r.ok())
-    .collect();
-    
-    println!("[DEBUG READ] get_events_by_type: type={}, count={}", event_type, results.len());
-    results
-}
-
-fn get_latest_week_advanced(conn: &Connection) -> Option<WeekAdvancedEvent> {
-    let mut stmt = conn
-        .prepare("SELECT payload FROM events WHERE event_type = 'week_advanced' ORDER BY id DESC LIMIT 1")
-        .unwrap();
-    
-    stmt.query_row([], |row| {
-        let payload_str: String = row.get(0)?;
-        Ok(payload_str)
-    })
-    .ok()
-    .map(|s| serde_json::from_str(&s).unwrap())
-}
-
-fn log_ui_click(conn: &Connection, click_type: &str, x: Option<i32>, y: Option<i32>, target: Option<String>) -> String {
-    let event = UiClickedEvent {
-        event_id: Uuid::new_v4().to_string(),
-        click_type: click_type.to_string(),
-        x,
-        y,
-        target,
-        clicked_at: chrono::Utc::now().to_rfc3339(),
-    };
-    append_event(conn, "ui_clicked", &event).unwrap();
-    event.event_id
-}
-
-fn get_current_week(conn: &Connection) -> u32 {
-    get_latest_week_advanced(conn)
-        .map(|e| e.to_week)
-        .unwrap_or(0)
-}
-
-fn get_current_target(conn: &Connection) -> Option<(i32, i32)> {
-    get_latest_week_advanced(conn)
-        .map(|e| (e.next_target_x, e.next_target_y))
-}
 
 fn get_default_tile_pattern() -> HashMap<(i32, i32), Vec<u8>> {
     let colors: Vec<(u8, u8, u8)> = APPROVED_COLORS
@@ -266,17 +265,17 @@ fn get_default_tile_pattern() -> HashMap<(i32, i32), Vec<u8>> {
     tiles
 }
 
-fn get_wall_tiles(conn: &Connection) -> HashMap<(i32, i32), Vec<u8>> {
+fn get_wall_tiles(events_path: &str) -> HashMap<(i32, i32), Vec<u8>> {
     let mut tiles = get_default_tile_pattern();
     
-    let week_events: Vec<WeekAdvancedEvent> = get_events_by_type(conn, "week_advanced")
+    let week_events: Vec<WeekAdvancedEvent> = get_events_by_type(events_path, "week_advanced")
         .into_iter()
         .map(|(_, e)| e)
         .collect();
     
     println!("[DEBUG WALL] get_wall_tiles: week_advanced events count: {}", week_events.len());
     
-    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type::<ImageUploadedEvent>(conn, "image_uploaded")
+    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type::<ImageUploadedEvent>(events_path, "image_uploaded")
         .into_iter()
         .map(|(_, e)| (e.event_id.clone(), e))
         .collect();
@@ -301,17 +300,83 @@ fn get_wall_tiles(conn: &Connection) -> HashMap<(i32, i32), Vec<u8>> {
     tiles
 }
 
-fn get_current_week_images(conn: &Connection, current_week: u32) -> Vec<ImageUploadedEvent> {
-    let events: Vec<(String, ImageUploadedEvent)> = get_events_by_type(conn, "image_uploaded");
-    events
+fn get_current_week_images(events_path: &str, week: u32) -> Vec<ImageUploadedEvent> {
+    get_events_by_type::<ImageUploadedEvent>(events_path, "image_uploaded")
         .into_iter()
         .map(|(_, e)| e)
-        .filter(|e| e.week == current_week)
+        .filter(|e| e.week == week)
         .collect()
 }
 
-fn get_coordinate_votes_for_week(conn: &Connection, week: u32) -> Vec<CoordinateVotedEvent> {
-    let events: Vec<(String, CoordinateVotedEvent)> = get_events_by_type(conn, "coordinate_voted");
+fn get_wall_tiles_for_week(events_path: &str, target_week: u32) -> HashMap<(i32, i32), Vec<u8>> {
+    let mut tiles = get_default_tile_pattern();
+    
+    let week_events: Vec<WeekAdvancedEvent> = get_events_by_type::<WeekAdvancedEvent>(events_path, "week_advanced")
+        .into_iter()
+        .map(|(_, e)| e)
+        .filter(|e| e.to_week <= target_week)
+        .collect();
+    
+    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type::<ImageUploadedEvent>(events_path, "image_uploaded")
+        .into_iter()
+        .map(|(_, e)| (e.event_id.clone(), e))
+        .collect();
+    
+    for event in &week_events {
+        if event.applied_x >= 0 && event.applied_y >= 0 {
+            if let Some(img_event_id) = &event.winning_image_event_id {
+                if let Some(img_event) = image_events.get(img_event_id) {
+                    tiles.insert((event.applied_x, event.applied_y), img_event.pixel_data.clone());
+                }
+            }
+        }
+    }
+    
+    tiles
+}
+
+fn render_wall_preview_for_week(events_path: &str, target_week: u32) -> Vec<u8> {
+    let tiles = get_wall_tiles_for_week(events_path, target_week);
+    
+    let mut pixels = vec![255u8; (TOTAL_WIDTH * TOTAL_HEIGHT * 3) as usize];
+    
+    for ty in 0..WALL_HEIGHT_PLATES as i32 {
+        for tx in 0..WALL_WIDTH_PLATES as i32 {
+            if let Some(tile_data) = tiles.get(&(tx, ty)) {
+                for py in 0..PLATE_SIZE {
+                    for px in 0..PLATE_SIZE {
+                        let tile_pixel_idx = ((py * PLATE_SIZE + px) * 3) as usize;
+                        let wall_pixel_idx = (((ty * PLATE_SIZE as i32 + py as i32) * TOTAL_WIDTH as i32 
+                            + (tx * PLATE_SIZE as i32 + px as i32)) * 3) as usize;
+                        
+                        if tile_pixel_idx + 2 < tile_data.len() && wall_pixel_idx + 2 < pixels.len() {
+                            pixels[wall_pixel_idx] = tile_data[tile_pixel_idx];
+                            pixels[wall_pixel_idx + 1] = tile_data[tile_pixel_idx + 1];
+                            pixels[wall_pixel_idx + 2] = tile_data[tile_pixel_idx + 2];
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    let mut img = image::RgbImage::new(TOTAL_WIDTH, TOTAL_HEIGHT);
+    
+    for (i, chunk) in pixels.chunks(3).enumerate() {
+        let x = (i as u32) % TOTAL_WIDTH;
+        let y = (i as u32) / TOTAL_WIDTH;
+        if chunk.len() == 3 {
+            img.put_pixel(x, y, image::Rgb([chunk[0], chunk[1], chunk[2]]));
+        }
+    }
+
+    let mut buf = Vec::new();
+    img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+    buf
+}
+
+fn get_coordinate_votes_for_week(events_path: &str, week: u32) -> Vec<CoordinateVotedEvent> {
+    let events: Vec<(String, CoordinateVotedEvent)> = get_events_by_type(events_path, "coordinate_voted");
     events
         .into_iter()
         .map(|(_, e)| e)
@@ -319,8 +384,8 @@ fn get_coordinate_votes_for_week(conn: &Connection, week: u32) -> Vec<Coordinate
         .collect()
 }
 
-fn render_wall_preview(conn: &Connection) -> Vec<u8> {
-    let tiles = get_wall_tiles(conn);
+fn render_wall_preview(events_path: &str) -> Vec<u8> {
+    let tiles = get_wall_tiles(events_path);
     
     let mut pixels = vec![255u8; (TOTAL_WIDTH * TOTAL_HEIGHT * 3) as usize];
     
@@ -360,22 +425,22 @@ fn render_wall_preview(conn: &Connection) -> Vec<u8> {
 }
 
 async fn get_wall(data: web::Data<AppState>) -> impl Responder {
-    let conn = data.db.lock().unwrap();
+    let events_path = data.events_path.lock().unwrap();
     
     let png_data = match get_cached_wall() {
         Some(data) => data,
         None => {
-            let data = render_wall_preview(&conn);
+            let data = render_wall_preview(&events_path);
             save_cached_wall(&data);
             data
         }
     };
     let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
     
-    let current_target = get_current_target(&conn);
+    let current_target = get_current_target(&events_path);
     
     let json_state = serde_json::json!({
-        "week": get_current_week(&conn),
+        "week": get_current_week(&events_path),
         "current_target": current_target.map(|(x, y)| serde_json::json!({"x": x, "y": y})),
         "image": format!("data:image/png;base64,{}", base64_data),
         "dimensions": {
@@ -393,13 +458,37 @@ async fn get_wall(data: web::Data<AppState>) -> impl Responder {
         .json(json_state)
 }
 
+async fn get_wall_for_week(data: web::Data<AppState>, week: web::Path<u32>) -> impl Responder {
+    let events_path = data.events_path.lock().unwrap();
+    let target_week = *week;
+    
+    let png_data = render_wall_preview_for_week(&events_path, target_week);
+    let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
+    
+    let json_state = serde_json::json!({
+        "week": target_week,
+        "image": format!("data:image/png;base64,{}", base64_data),
+        "dimensions": {
+            "width_plates": WALL_WIDTH_PLATES,
+            "height_plates": WALL_HEIGHT_PLATES,
+            "plate_size": PLATE_SIZE,
+            "total_width": TOTAL_WIDTH,
+            "total_height": TOTAL_HEIGHT
+        }
+    });
+    
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(json_state)
+}
+
 async fn list_images(data: web::Data<AppState>) -> impl Responder {
-    let conn = data.db.lock().unwrap();
-    let current_week = get_current_week(&conn);
+    let events_path = data.events_path.lock().unwrap();
+    let current_week = get_current_week(&events_path);
     
-    let image_events = get_current_week_images(&conn, current_week);
+    let image_events = get_current_week_images(&events_path, current_week);
     
-    let image_vote_events: Vec<ImageVotedEvent> = get_events_by_type(&conn, "image_voted")
+    let image_vote_events: Vec<ImageVotedEvent> = get_events_by_type(&events_path, "image_voted")
         .into_iter()
         .map(|(_, e)| e)
         .collect();
@@ -578,9 +667,9 @@ async fn upload_image(mut payload: Multipart, data: web::Data<AppState>) -> impl
         }));
     }
 
-    let conn = data.db.lock().unwrap();
-    let current_week = get_current_week(&conn);
-    let current_target = get_current_target(&conn);
+    let events_path = data.events_path.lock().unwrap();
+    let current_week = get_current_week(&events_path);
+    let current_target = get_current_target(&events_path);
     
     let (target_x, target_y) = match current_target {
         Some((x, y)) => (x, y),
@@ -602,7 +691,7 @@ async fn upload_image(mut payload: Multipart, data: web::Data<AppState>) -> impl
         uploaded_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    append_event(&conn, "image_uploaded", &event).unwrap();
+    append_json_event(&events_path, "image_uploaded", &serde_json::to_value(&event).unwrap());
 
     let preview = create_image_preview(&event.pixel_data, PLATE_SIZE, PLATE_SIZE);
     let base64_preview = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &preview);
@@ -619,9 +708,9 @@ async fn upload_image(mut payload: Multipart, data: web::Data<AppState>) -> impl
 }
 
 async fn vote_image(req: web::Json<VoteRequest>, data: web::Data<AppState>) -> impl Responder {
-    let conn = data.db.lock().unwrap();
+    let events_path = data.events_path.lock().unwrap();
     
-    let image_events: Vec<ImageUploadedEvent> = get_events_by_type(&conn, "image_uploaded")
+    let image_events: Vec<ImageUploadedEvent> = get_events_by_type(&events_path, "image_uploaded")
         .into_iter()
         .map(|(_, e)| e)
         .collect();
@@ -638,9 +727,9 @@ async fn vote_image(req: web::Json<VoteRequest>, data: web::Data<AppState>) -> i
         voted_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    append_event(&conn, "image_voted", &event).unwrap();
+    append_json_event(&events_path, "image_voted", &serde_json::to_value(&event).unwrap());
 
-    let image_vote_events: Vec<ImageVotedEvent> = get_events_by_type(&conn, "image_voted")
+    let image_vote_events: Vec<ImageVotedEvent> = get_events_by_type(&events_path, "image_voted")
         .into_iter()
         .map(|(_, e)| e)
         .collect();
@@ -666,8 +755,8 @@ async fn vote_coordinate(req: web::Json<CoordinateVoteRequest>, data: web::Data<
         }));
     }
 
-    let conn = data.db.lock().unwrap();
-    let current_week = get_current_week(&conn);
+    let events_path = data.events_path.lock().unwrap();
+    let current_week = get_current_week(&events_path);
     let next_week = current_week + 1;
     
     let event = CoordinateVotedEvent {
@@ -678,9 +767,9 @@ async fn vote_coordinate(req: web::Json<CoordinateVoteRequest>, data: web::Data<
         voted_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    append_event(&conn, "coordinate_voted", &event).unwrap();
+    append_json_event(&events_path, "coordinate_voted", &serde_json::to_value(&event).unwrap());
 
-    let coord_events: Vec<(String, CoordinateVotedEvent)> = get_events_by_type(&conn, "coordinate_voted");
+    let coord_events: Vec<(String, CoordinateVotedEvent)> = get_events_by_type(&events_path, "coordinate_voted");
     let coordinate_vote_events: Vec<CoordinateVotedEvent> = coord_events
         .into_iter()
         .map(|(_, e)| e)
@@ -706,11 +795,11 @@ pub struct CoordinateVoteRequest {
 }
 
 async fn get_coordinate_votes(data: web::Data<AppState>) -> impl Responder {
-    let conn = data.db.lock().unwrap();
-    let current_week = get_current_week(&conn);
+    let events_path = data.events_path.lock().unwrap();
+    let current_week = get_current_week(&events_path);
     let next_week = current_week + 1;
     
-    let coordinate_vote_events = get_coordinate_votes_for_week(&conn, next_week);
+    let coordinate_vote_events = get_coordinate_votes_for_week(&events_path, next_week);
     
     let mut vote_counts: HashMap<String, i32> = HashMap::new();
     for event in &coordinate_vote_events {
@@ -750,12 +839,20 @@ pub struct UiClickRequest {
 }
 
 async fn ui_click(req: web::Json<UiClickRequest>, data: web::Data<AppState>) -> impl Responder {
-    let conn = data.db.lock().unwrap();
-    let event_id = log_ui_click(&conn, &req.click_type, req.x, req.y, req.target.clone());
+    let events_path = data.events_path.lock().unwrap();
+    let event = UiClickedEvent {
+        event_id: Uuid::new_v4().to_string(),
+        click_type: req.click_type.clone(),
+        x: req.x,
+        y: req.y,
+        target: req.target.clone(),
+        clicked_at: chrono::Utc::now().to_rfc3339(),
+    };
+    append_json_event(&events_path, "ui_clicked", &serde_json::to_value(&event).unwrap());
     
     HttpResponse::Ok().json(serde_json::json!({
         "success": true,
-        "event_id": event_id,
+        "event_id": event.event_id,
         "click_type": req.click_type,
         "x": req.x,
         "y": req.y,
@@ -764,93 +861,59 @@ async fn ui_click(req: web::Json<UiClickRequest>, data: web::Data<AppState>) -> 
 }
 
 async fn get_all_events(data: web::Data<AppState>) -> impl Responder {
-    let conn = data.db.lock().unwrap();
+    let events_path = data.events_path.lock().unwrap();
     
-    let mut stmt = conn
-        .prepare("SELECT event_type, event_id, payload, created_at FROM events ORDER BY id ASC")
-        .unwrap();
+    let events = get_all_events_json(&events_path);
     
-    let events: Vec<HashMap<String, Value>> = stmt
-        .query_map([], |row| {
-            let event_type: String = row.get(0)?;
-            let event_id: String = row.get(1)?;
-            let payload_str: String = row.get(2)?;
-            let created_at: String = row.get(3)?;
-            
-            let payload: Value = serde_json::from_str(&payload_str).unwrap_or(serde_json::json!("{}"));
-            
+    let result: Vec<HashMap<String, Value>> = events
+        .into_iter()
+        .map(|(event_type, event_id, payload, created_at)| {
             let mut event = HashMap::new();
             event.insert("event_type".to_string(), serde_json::json!(event_type));
             event.insert("event_id".to_string(), serde_json::json!(event_id));
             event.insert("payload".to_string(), payload);
             event.insert("created_at".to_string(), serde_json::json!(created_at));
-            Ok(event)
+            event
         })
-        .unwrap()
-        .filter_map(|r| r.ok())
         .collect();
-    
-    let image_count = events.iter().filter(|e| e.get("event_type").map(|t| t == "image_uploaded").unwrap_or(false)).count();
-    let image_vote_count = events.iter().filter(|e| e.get("event_type").map(|t| t == "image_voted").unwrap_or(false)).count();
-    let coord_vote_count = events.iter().filter(|e| e.get("event_type").map(|t| t == "coordinate_voted").unwrap_or(false)).count();
-    let week_advanced_count = events.iter().filter(|e| e.get("event_type").map(|t| t == "week_advanced").unwrap_or(false)).count();
-    let ui_click_count = events.iter().filter(|e| e.get("event_type").map(|t| t == "ui_clicked").unwrap_or(false)).count();
-    
-    HttpResponse::Ok().json(serde_json::json!({
-        "events": events,
-        "counts": {
-            "image_uploaded": image_count,
-            "image_voted": image_vote_count,
-            "coordinate_voted": coord_vote_count,
-            "week_advanced": week_advanced_count,
-            "ui_clicked": ui_click_count,
-            "total": events.len()
-        }
-    }))
+
+    HttpResponse::Ok().json(result)
 }
 
 async fn get_events_by_type_endpoint(data: web::Data<AppState>, event_type: web::Path<String>) -> impl Responder {
-    let conn = data.db.lock().unwrap();
+    let events_path = data.events_path.lock().unwrap();
     let et = event_type.as_str();
     
-    let mut stmt = conn
-        .prepare("SELECT event_id, payload, created_at FROM events WHERE event_type = ?1 ORDER BY id ASC")
-        .unwrap();
+    let events = get_all_events_json(&events_path);
     
-    let events: Vec<HashMap<String, Value>> = stmt
-        .query_map([et], |row| {
-            let event_id: String = row.get(0)?;
-            let payload_str: String = row.get(1)?;
-            let created_at: String = row.get(2)?;
-            
-            let payload: Value = serde_json::from_str(&payload_str).unwrap_or(serde_json::json!("{}"));
-            
+    let filtered: Vec<HashMap<String, Value>> = events
+        .into_iter()
+        .filter(|(t, _, _, _)| t == et)
+        .map(|(_, event_id, payload, created_at)| {
             let mut event = HashMap::new();
             event.insert("event_id".to_string(), serde_json::json!(event_id));
             event.insert("payload".to_string(), payload);
             event.insert("created_at".to_string(), serde_json::json!(created_at));
-            Ok(event)
+            event
         })
-        .unwrap()
-        .filter_map(|r| r.ok())
         .collect();
     
     HttpResponse::Ok().json(serde_json::json!({
         "event_type": et,
-        "events": events,
-        "count": events.len()
+        "events": filtered,
+        "count": filtered.len()
     }))
 }
 
 async fn reset_and_replay(data: web::Data<AppState>) -> impl Responder {
     clear_cache();
     
-    let conn = data.db.lock().unwrap();
-    let png_data = render_wall_preview(&conn);
+    let events_path = data.events_path.lock().unwrap();
+    let png_data = render_wall_preview(&events_path);
     save_cached_wall(&png_data);
     
-    let current_week = get_current_week(&conn);
-    let current_target = get_current_target(&conn);
+    let current_week = get_current_week(&events_path);
+    let current_target = get_current_target(&events_path);
     
     HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -862,13 +925,13 @@ async fn reset_and_replay(data: web::Data<AppState>) -> impl Responder {
 }
 
 async fn advance_week(data: web::Data<AppState>) -> impl Responder {
-    let conn = data.db.lock().unwrap();
+    let events_path = data.events_path.lock().unwrap();
     
-    let current_week = get_current_week(&conn);
-    let current_target = get_current_target(&conn);
+    let current_week = get_current_week(&events_path);
+    let current_target = get_current_target(&events_path);
     let next_week = current_week + 1;
     
-    let coordinate_vote_events = get_coordinate_votes_for_week(&conn, next_week);
+    let coordinate_vote_events = get_coordinate_votes_for_week(&events_path, next_week);
     
     let mut coord_vote_counts: HashMap<(i32, i32), i32> = HashMap::new();
     for event in &coordinate_vote_events {
@@ -887,9 +950,9 @@ async fn advance_week(data: web::Data<AppState>) -> impl Responder {
     
     let (next_target_x, next_target_y) = winner_coord.unwrap();
     
-    let image_events = get_current_week_images(&conn, current_week);
+    let image_events = get_current_week_images(&events_path, current_week);
     
-    let image_vote_events: Vec<ImageVotedEvent> = get_events_by_type(&conn, "image_voted")
+    let image_vote_events: Vec<ImageVotedEvent> = get_events_by_type(&events_path, "image_voted")
         .into_iter()
         .map(|(_, e)| e)
         .collect();
@@ -919,10 +982,10 @@ async fn advance_week(data: web::Data<AppState>) -> impl Responder {
         applied_at: chrono::Utc::now().to_rfc3339(),
     };
 
-    append_event(&conn, "week_advanced", &event).unwrap();
+    append_json_event(&events_path, "week_advanced", &serde_json::to_value(&event).unwrap());
 
     clear_cache();
-    let png_data = render_wall_preview(&conn);
+    let png_data = render_wall_preview(&events_path);
     save_cached_wall(&png_data);
     let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
 
@@ -936,23 +999,23 @@ async fn advance_week(data: web::Data<AppState>) -> impl Responder {
 }
 
 async fn get_stats(data: web::Data<AppState>) -> impl Responder {
-    let conn = data.db.lock().unwrap();
+    let events_path = data.events_path.lock().unwrap();
     
-    let image_vote_events: Vec<ImageVotedEvent> = get_events_by_type(&conn, "image_voted")
+    let image_vote_events: Vec<ImageVotedEvent> = get_events_by_type(&events_path, "image_voted")
         .into_iter()
         .map(|(_, e)| e)
         .collect();
     
-    let current_week = get_current_week(&conn);
+    let current_week = get_current_week(&events_path);
     let next_week = current_week + 1;
     
-    let coordinate_vote_events = get_coordinate_votes_for_week(&conn, next_week);
+    let coordinate_vote_events = get_coordinate_votes_for_week(&events_path, next_week);
     
-    let image_events = get_current_week_images(&conn, current_week);
+    let image_events = get_current_week_images(&events_path, current_week);
 
     HttpResponse::Ok().json(serde_json::json!({
         "week": current_week,
-        "current_target": get_current_target(&conn).map(|(x, y)| serde_json::json!({"x": x, "y": y})),
+        "current_target": get_current_target(&events_path).map(|(x, y)| serde_json::json!({"x": x, "y": y})),
         "total_image_votes": image_vote_events.len(),
         "total_coordinate_votes": coordinate_vote_events.len(),
         "total_images": image_events.len(),
@@ -967,15 +1030,16 @@ async fn get_stats(data: web::Data<AppState>) -> impl Responder {
 }
 
 async fn get_week_history(data: web::Data<AppState>) -> impl Responder {
-    let conn = data.db.lock().unwrap();
+    let events_path = data.events_path.lock().unwrap();
     
-    let week_events: Vec<WeekAdvancedEvent> = get_events_by_type(&conn, "week_advanced")
+    let week_events: Vec<WeekAdvancedEvent> = get_events_by_type(&events_path, "week_advanced")
         .into_iter()
         .map(|(_, e)| e)
         .collect();
     
-    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type(&conn, "image_uploaded")
+    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type::<ImageUploadedEvent>(&events_path, "image_uploaded")
         .into_iter()
+        .map(|(_, e)| (e.event_id.clone(), e))
         .collect();
 
     let history: Vec<Value> = week_events
@@ -1196,6 +1260,7 @@ async fn index() -> impl Responder {
             const nextBtn = document.getElementById('nextWeek');
             
             prevBtn.disabled = currentWeek <= 0;
+            nextBtn.disabled = currentWeek >= parseInt(document.getElementById('week').textContent);
             
             const weekInfo = document.getElementById('weekHistoryInfo');
             const historyEntry = history.find(h => h.week === currentWeek);
@@ -1214,6 +1279,14 @@ async fn index() -> impl Responder {
             } else {
                 weekInfo.style.display = 'none';
             }
+            
+            loadWallForWeek(currentWeek);
+        }
+        
+        async function loadWallForWeek(week) {
+            const res = await fetch('/api/wall/' + week);
+            const data = await res.json();
+            document.getElementById('wallImage').src = data.image;
         }
 
         function prevWeek() {
@@ -1224,8 +1297,8 @@ async fn index() -> impl Responder {
         }
 
         function nextWeek() {
-            const currentWeek = parseInt(document.getElementById('week').textContent);
-            if (window.currentWeek < currentWeek) {
+            const actualWeek = parseInt(document.getElementById('week').textContent);
+            if (window.currentWeek < actualWeek) {
                 window.currentWeek++;
                 updateWeekNavigation();
             }
@@ -1417,29 +1490,21 @@ async fn main() -> std::io::Result<()> {
     clear_cache();
     println!("Cache cleared on startup");
     
-    let conn = Connection::open("wall.db").expect("Failed to open database");
-    init_db(&conn).expect("Failed to initialize database");
+    let events_path = EVENTS_FILE.to_string();
     
-    println!("[DEBUG STARTUP] Dumping all events from database...");
-    {
-        let mut stmt = conn.prepare("SELECT event_type, event_id, payload, created_at FROM events ORDER BY id ASC").unwrap();
-        let _ = stmt.query_map([], |row| {
-            let event_type: String = row.get(0)?;
-            let event_id: String = row.get(1)?;
-            let payload: String = row.get(2)?;
-            let created_at: String = row.get(3)?;
-            println!("[DEBUG STARTUP] event: type={}, id={}, created_at={}", event_type, event_id, created_at);
-            println!("[DEBUG STARTUP]   payload: {}", payload);
-            Ok(())
-        }).unwrap();
+    println!("[DEBUG STARTUP] Dumping all events from {}...", EVENTS_FILE);
+    let all_events = get_all_events_json(&events_path);
+    for (event_type, event_id, payload, created_at) in &all_events {
+        println!("[DEBUG STARTUP] event: type={}, id={}, created_at={}", event_type, event_id, created_at);
+        println!("[DEBUG STARTUP]   payload: {}", payload);
     }
     
-    let png_data = render_wall_preview(&conn);
+    let png_data = render_wall_preview(&events_path);
     save_cached_wall(&png_data);
     println!("Wall regenerated from events and cached");
 
     let app_state = web::Data::new(AppState {
-        db: Mutex::new(conn),
+        events_path: Mutex::new(events_path),
     });
 
     println!("Starting server at http://127.0.0.1:8080");
@@ -1451,6 +1516,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(app_state.clone())
             .route("/", web::get().to(index))
             .route("/api/wall", web::get().to(get_wall))
+            .route("/api/wall/{week}", web::get().to(get_wall_for_week))
             .route("/api/images", web::get().to(list_images))
             .route("/api/upload", web::post().to(upload_image))
             .route("/api/vote", web::post().to(vote_image))
