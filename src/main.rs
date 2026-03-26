@@ -5,7 +5,9 @@ use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::fs;
 use std::io::Cursor;
+use std::path::Path;
 use std::sync::Mutex;
 use uuid::Uuid;
 
@@ -28,8 +30,39 @@ const APPROVED_COLORS: &[(&str, u8, u8, u8)] = &[
     ("SVART", 0, 0, 0),
 ];
 
+const CACHE_DIR: &str = "./cache";
+
 struct AppState {
     db: Mutex<Connection>,
+}
+
+fn ensure_cache_dir() {
+    if !Path::new(CACHE_DIR).exists() {
+        fs::create_dir_all(CACHE_DIR).expect("Failed to create cache directory");
+    }
+}
+
+fn clear_cache() {
+    ensure_cache_dir();
+    if let Ok(entries) = fs::read_dir(CACHE_DIR) {
+        for entry in entries.flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+fn get_cached_wall_path() -> String {
+    format!("{}/wall.png", CACHE_DIR)
+}
+
+fn save_cached_wall(png_data: &[u8]) {
+    let path = get_cached_wall_path();
+    let _ = fs::write(&path, png_data);
+}
+
+fn get_cached_wall() -> Option<Vec<u8>> {
+    let path = get_cached_wall_path();
+    fs::read(&path).ok()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +103,16 @@ pub struct WeekAdvancedEvent {
     pub next_target_x: i32,
     pub next_target_y: i32,
     pub applied_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiClickedEvent {
+    pub event_id: String,
+    pub click_type: String,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub target: Option<String>,
+    pub clicked_at: String,
 }
 
 fn color_distance(r1: u8, g1: u8, b1: u8, r2: u8, g2: u8, b2: u8) -> f64 {
@@ -133,6 +176,8 @@ fn append_event<T: Serialize>(conn: &Connection, event_type: &str, payload: &T) 
     let created_at = chrono::Utc::now().to_rfc3339();
     let payload_json = serde_json::to_string(payload).unwrap();
     
+    println!("[DEBUG WRITE] append_event: type={}, event_id={}, payload={}", event_type, event_id, payload_json);
+    
     conn.execute(
         "INSERT INTO events (event_type, event_id, payload, created_at) VALUES (?1, ?2, ?3, ?4)",
         params![event_type, event_id, payload_json, created_at],
@@ -142,11 +187,13 @@ fn append_event<T: Serialize>(conn: &Connection, event_type: &str, payload: &T) 
 }
 
 fn get_events_by_type<T: for<'de> Deserialize<'de>>(conn: &Connection, event_type: &str) -> Vec<(String, T)> {
+    println!("[DEBUG READ] get_events_by_type: type={}", event_type);
+    
     let mut stmt = conn
         .prepare("SELECT event_id, payload FROM events WHERE event_type = ?1 ORDER BY id ASC")
         .unwrap();
     
-    stmt.query_map([event_type], |row| {
+    let results: Vec<(String, T)> = stmt.query_map([event_type], |row| {
         let event_id: String = row.get(0)?;
         let payload_str: String = row.get(1)?;
         let payload: T = serde_json::from_str(&payload_str).unwrap();
@@ -154,7 +201,10 @@ fn get_events_by_type<T: for<'de> Deserialize<'de>>(conn: &Connection, event_typ
     })
     .unwrap()
     .filter_map(|r| r.ok())
-    .collect()
+    .collect();
+    
+    println!("[DEBUG READ] get_events_by_type: type={}, count={}", event_type, results.len());
+    results
 }
 
 fn get_latest_week_advanced(conn: &Connection) -> Option<WeekAdvancedEvent> {
@@ -168,6 +218,19 @@ fn get_latest_week_advanced(conn: &Connection) -> Option<WeekAdvancedEvent> {
     })
     .ok()
     .map(|s| serde_json::from_str(&s).unwrap())
+}
+
+fn log_ui_click(conn: &Connection, click_type: &str, x: Option<i32>, y: Option<i32>, target: Option<String>) -> String {
+    let event = UiClickedEvent {
+        event_id: Uuid::new_v4().to_string(),
+        click_type: click_type.to_string(),
+        x,
+        y,
+        target,
+        clicked_at: chrono::Utc::now().to_rfc3339(),
+    };
+    append_event(conn, "ui_clicked", &event).unwrap();
+    event.event_id
 }
 
 fn get_current_week(conn: &Connection) -> u32 {
@@ -211,14 +274,26 @@ fn get_wall_tiles(conn: &Connection) -> HashMap<(i32, i32), Vec<u8>> {
         .map(|(_, e)| e)
         .collect();
     
-    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type(conn, "image_uploaded")
+    println!("[DEBUG WALL] get_wall_tiles: week_advanced events count: {}", week_events.len());
+    
+    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type::<ImageUploadedEvent>(conn, "image_uploaded")
         .into_iter()
+        .map(|(_, e)| (e.event_id.clone(), e))
         .collect();
     
-    for event in week_events {
-        if let Some(img_event_id) = &event.winning_image_event_id {
-            if let Some(img_event) = image_events.get(img_event_id) {
-                tiles.insert((event.applied_x, event.applied_y), img_event.pixel_data.clone());
+    println!("[DEBUG WALL] get_wall_tiles: image_uploaded events count: {}", image_events.len());
+    
+    for event in &week_events {
+        println!("[DEBUG WALL] Processing week_advanced: from={}, to={}, applied=({},{}), winning_image={:?}", 
+            event.from_week, event.to_week, event.applied_x, event.applied_y, event.winning_image_event_id);
+        if event.applied_x >= 0 && event.applied_y >= 0 {
+            if let Some(img_event_id) = &event.winning_image_event_id {
+                if let Some(img_event) = image_events.get(img_event_id) {
+                    println!("[DEBUG WALL] Applying image {} to tile ({}, {})", img_event_id, event.applied_x, event.applied_y);
+                    tiles.insert((event.applied_x, event.applied_y), img_event.pixel_data.clone());
+                } else {
+                    println!("[DEBUG WALL] WARNING: image_event_id {} not found in image_events!", img_event_id);
+                }
             }
         }
     }
@@ -287,7 +362,14 @@ fn render_wall_preview(conn: &Connection) -> Vec<u8> {
 async fn get_wall(data: web::Data<AppState>) -> impl Responder {
     let conn = data.db.lock().unwrap();
     
-    let png_data = render_wall_preview(&conn);
+    let png_data = match get_cached_wall() {
+        Some(data) => data,
+        None => {
+            let data = render_wall_preview(&conn);
+            save_cached_wall(&data);
+            data
+        }
+    };
     let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
     
     let current_target = get_current_target(&conn);
@@ -302,7 +384,8 @@ async fn get_wall(data: web::Data<AppState>) -> impl Responder {
             "plate_size": PLATE_SIZE,
             "total_width": TOTAL_WIDTH,
             "total_height": TOTAL_HEIGHT
-        }
+        },
+        "cached": get_cached_wall().is_some()
     });
     
     HttpResponse::Ok()
@@ -658,6 +741,126 @@ async fn get_coordinate_votes(data: web::Data<AppState>) -> impl Responder {
         .json(votes)
 }
 
+#[derive(Deserialize)]
+pub struct UiClickRequest {
+    pub click_type: String,
+    pub x: Option<i32>,
+    pub y: Option<i32>,
+    pub target: Option<String>,
+}
+
+async fn ui_click(req: web::Json<UiClickRequest>, data: web::Data<AppState>) -> impl Responder {
+    let conn = data.db.lock().unwrap();
+    let event_id = log_ui_click(&conn, &req.click_type, req.x, req.y, req.target.clone());
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "event_id": event_id,
+        "click_type": req.click_type,
+        "x": req.x,
+        "y": req.y,
+        "target": req.target
+    }))
+}
+
+async fn get_all_events(data: web::Data<AppState>) -> impl Responder {
+    let conn = data.db.lock().unwrap();
+    
+    let mut stmt = conn
+        .prepare("SELECT event_type, event_id, payload, created_at FROM events ORDER BY id ASC")
+        .unwrap();
+    
+    let events: Vec<HashMap<String, Value>> = stmt
+        .query_map([], |row| {
+            let event_type: String = row.get(0)?;
+            let event_id: String = row.get(1)?;
+            let payload_str: String = row.get(2)?;
+            let created_at: String = row.get(3)?;
+            
+            let payload: Value = serde_json::from_str(&payload_str).unwrap_or(serde_json::json!("{}"));
+            
+            let mut event = HashMap::new();
+            event.insert("event_type".to_string(), serde_json::json!(event_type));
+            event.insert("event_id".to_string(), serde_json::json!(event_id));
+            event.insert("payload".to_string(), payload);
+            event.insert("created_at".to_string(), serde_json::json!(created_at));
+            Ok(event)
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    
+    let image_count = events.iter().filter(|e| e.get("event_type").map(|t| t == "image_uploaded").unwrap_or(false)).count();
+    let image_vote_count = events.iter().filter(|e| e.get("event_type").map(|t| t == "image_voted").unwrap_or(false)).count();
+    let coord_vote_count = events.iter().filter(|e| e.get("event_type").map(|t| t == "coordinate_voted").unwrap_or(false)).count();
+    let week_advanced_count = events.iter().filter(|e| e.get("event_type").map(|t| t == "week_advanced").unwrap_or(false)).count();
+    let ui_click_count = events.iter().filter(|e| e.get("event_type").map(|t| t == "ui_clicked").unwrap_or(false)).count();
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "events": events,
+        "counts": {
+            "image_uploaded": image_count,
+            "image_voted": image_vote_count,
+            "coordinate_voted": coord_vote_count,
+            "week_advanced": week_advanced_count,
+            "ui_clicked": ui_click_count,
+            "total": events.len()
+        }
+    }))
+}
+
+async fn get_events_by_type_endpoint(data: web::Data<AppState>, event_type: web::Path<String>) -> impl Responder {
+    let conn = data.db.lock().unwrap();
+    let et = event_type.as_str();
+    
+    let mut stmt = conn
+        .prepare("SELECT event_id, payload, created_at FROM events WHERE event_type = ?1 ORDER BY id ASC")
+        .unwrap();
+    
+    let events: Vec<HashMap<String, Value>> = stmt
+        .query_map([et], |row| {
+            let event_id: String = row.get(0)?;
+            let payload_str: String = row.get(1)?;
+            let created_at: String = row.get(2)?;
+            
+            let payload: Value = serde_json::from_str(&payload_str).unwrap_or(serde_json::json!("{}"));
+            
+            let mut event = HashMap::new();
+            event.insert("event_id".to_string(), serde_json::json!(event_id));
+            event.insert("payload".to_string(), payload);
+            event.insert("created_at".to_string(), serde_json::json!(created_at));
+            Ok(event)
+        })
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "event_type": et,
+        "events": events,
+        "count": events.len()
+    }))
+}
+
+async fn reset_and_replay(data: web::Data<AppState>) -> impl Responder {
+    clear_cache();
+    
+    let conn = data.db.lock().unwrap();
+    let png_data = render_wall_preview(&conn);
+    save_cached_wall(&png_data);
+    
+    let current_week = get_current_week(&conn);
+    let current_target = get_current_target(&conn);
+    
+    HttpResponse::Ok().json(serde_json::json!({
+        "success": true,
+        "message": "Cache cleared and wall regenerated from events",
+        "week": current_week,
+        "current_target": current_target.map(|(x, y)| serde_json::json!({"x": x, "y": y})),
+        "cache_cleared": true
+    }))
+}
+
 async fn advance_week(data: web::Data<AppState>) -> impl Responder {
     let conn = data.db.lock().unwrap();
     
@@ -718,7 +921,9 @@ async fn advance_week(data: web::Data<AppState>) -> impl Responder {
 
     append_event(&conn, "week_advanced", &event).unwrap();
 
+    clear_cache();
     let png_data = render_wall_preview(&conn);
+    save_cached_wall(&png_data);
     let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
 
     HttpResponse::Ok().json(serde_json::json!({
@@ -813,26 +1018,54 @@ async fn index() -> impl Responder {
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Pärlplattvotering</title>
     <style>
-        #coordGrid { background: #f00; }
         body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
         h1, h2, h3 { color: #333; }
         .section { background: white; padding: 20px; margin: 20px 0; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .stats { display: flex; gap: 20px; flex-wrap: wrap; }
+        .stat-box { background: #e3f2fd; padding: 15px; border-radius: 4px; text-align: center; }
+        .stat-box .value { font-size: 24px; font-weight: bold; color: #1976D2; }
+        .stat-box .label { color: #666; }
+        .approved-colors { display: flex; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
+        .color-swatch { width: 30px; height: 30px; border: 1px solid #333; border-radius: 4px; }
         .wall-container { text-align: center; }
+        .wall-instruction { font-style: italic; color: #666; margin-bottom: 10px; }
         .wall-wrapper { position: relative; display: inline-block; }
         .wall-image { display: block; }
         .wall-overlay { position: absolute; top: 0; left: 0; width: 810px; height: 360px; display: grid; grid-template-columns: repeat(27, 30px); grid-template-rows: repeat(12, 30px); pointer-events: none; opacity: 0; transition: opacity 0.2s; }
         .wall-wrapper:hover .wall-overlay { opacity: 1; pointer-events: auto; }
         .overlay-cell { width: 26px; height: 26px; border: 2px solid rgba(0,0,0,0.3); cursor: pointer; font-size: 10px; font-family: monospace; background: rgba(255,255,255,0.3); transition: background 0.1s; display: flex; align-items: center; justify-content: center; }
-        .overlay-cell.current-target { width: 26px; height: 26px; outline: 2px solid rgba(245, 124, 0, 1); animation: pulse 1s ease-in-out infinite; }
+        .overlay-cell:hover { background: rgba(76, 175, 80, 0.8); }
+        .overlay-cell.current-target { width: 26px; height: 26px; outline: 4px solid rgba(245, 124, 0, 1); animation: pulse 1s ease-in-out infinite; }
         .overlay-cell.current-target:hover { background: rgba(76, 175, 80, 0.8); }
         .overlay-cell.has-votes { background: rgba(200, 230, 201, 0.7); }
-        .overlay-cell:hover { background: rgba(76, 175, 80, 0.8); }
         @keyframes pulse {
             0%, 100% { opacity: 1; }
             50% { opacity: 0.3; }
         }
-        .vote-tooltip { position: absolute; background: rgba(0,0,0,0.8); color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; pointer-events: none; display: none; }
-        .vote-count { font-weight: bold; }
+        .week-nav { display: flex; align-items: center; justify-content: center; gap: 15px; margin: 10px 0; }
+        .week-nav button { background: #9c27b0; color: white; border: none; padding: 10px 20px; cursor: pointer; border-radius: 4px; font-size: 18px; }
+        .week-nav button:hover { background: #7b1fa2; }
+        .week-nav button:disabled { background: #ccc; cursor: not-allowed; }
+        .week-nav span { font-size: 18px; font-weight: bold; }
+        .week-info { background: #f3e5f5; padding: 10px; border-radius: 4px; margin-top: 10px; text-align: center; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 15px; }
+        .image-card { border: 1px solid #ddd; padding: 10px; border-radius: 4px; background: #fafafa; }
+        .image-card img { width: 100%; height: 150px; object-fit: contain; background: #eee; }
+        .image-card h4 { margin: 10px 0 5px; font-size: 14px; word-break: break-all; }
+        .image-card p { margin: 5px 0; color: #666; }
+        .vote-btn { background: #4CAF50; color: white; border: none; padding: 10px 20px; cursor: pointer; border-radius: 4px; width: 100%; }
+        .vote-btn:hover { background: #45a049; }
+        .admin-btn { background: #ff9800; color: white; border: none; padding: 15px 30px; cursor: pointer; border-radius: 4px; font-size: 16px; }
+        .admin-btn:hover { background: #f57c00; }
+        form { margin: 10px 0; }
+        input[type="file"] { margin: 10px 0; }
+        input[type="submit"] { background: #2196F3; color: white; border: none; padding: 10px 20px; cursor: pointer; border-radius: 4px; }
+        input[type="submit"]:hover { background: #1976D2; }
+        .coord-grid { display: grid; grid-template-columns: repeat(27, 1fr); gap: 1px; max-width: 100%; }
+        .coord-cell { aspect-ratio: 1; border: 1px solid #ccc; cursor: pointer; font-size: 8px; display: flex; align-items: center; justify-content: center; background: white; font-family: monospace; }
+        .coord-cell:hover { background: #e0e0e0; }
+        .coord-cell.target { background: #ffeb3b; border: 2px solid #f57c00; }
+        .coord-cell.has-votes { background: #c8e6c9; }
     </style>
 </head>
 <body>
@@ -1181,8 +1414,29 @@ async fn index() -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    clear_cache();
+    println!("Cache cleared on startup");
+    
     let conn = Connection::open("wall.db").expect("Failed to open database");
     init_db(&conn).expect("Failed to initialize database");
+    
+    println!("[DEBUG STARTUP] Dumping all events from database...");
+    {
+        let mut stmt = conn.prepare("SELECT event_type, event_id, payload, created_at FROM events ORDER BY id ASC").unwrap();
+        let _ = stmt.query_map([], |row| {
+            let event_type: String = row.get(0)?;
+            let event_id: String = row.get(1)?;
+            let payload: String = row.get(2)?;
+            let created_at: String = row.get(3)?;
+            println!("[DEBUG STARTUP] event: type={}, id={}, created_at={}", event_type, event_id, created_at);
+            println!("[DEBUG STARTUP]   payload: {}", payload);
+            Ok(())
+        }).unwrap();
+    }
+    
+    let png_data = render_wall_preview(&conn);
+    save_cached_wall(&png_data);
+    println!("Wall regenerated from events and cached");
 
     let app_state = web::Data::new(AppState {
         db: Mutex::new(conn),
@@ -1205,6 +1459,10 @@ async fn main() -> std::io::Result<()> {
             .route("/api/stats", web::get().to(get_stats))
             .route("/api/admin/advance", web::post().to(advance_week))
             .route("/api/week-history", web::get().to(get_week_history))
+            .route("/api/ui/click", web::post().to(ui_click))
+            .route("/api/events", web::get().to(get_all_events))
+            .route("/api/events/{event_type}", web::get().to(get_events_by_type_endpoint))
+            .route("/api/admin/reset-replay", web::post().to(reset_and_replay))
     })
     .bind("127.0.0.1:8080")?
     .run()
