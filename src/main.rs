@@ -482,6 +482,46 @@ async fn get_wall_for_week(data: web::Data<AppState>, week: web::Path<u32>) -> i
         .json(json_state)
 }
 
+async fn get_images_for_week(data: web::Data<AppState>, week: web::Path<u32>) -> impl Responder {
+    let events_path = data.events_path.lock().unwrap();
+    let target_week = *week;
+    
+    let image_events = get_current_week_images(&events_path, target_week);
+    
+    let image_vote_events: Vec<ImageVotedEvent> = get_events_by_type(&events_path, "image_voted")
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect();
+    
+    let mut vote_counts: HashMap<String, i32> = HashMap::new();
+    for vote in &image_vote_events {
+        *vote_counts.entry(vote.image_event_id.clone()).or_insert(0) += 1;
+    }
+    
+    let images: Vec<Value> = image_events
+        .into_iter()
+        .map(|img| {
+            let votes = vote_counts.get(&img.event_id).unwrap_or(&0);
+            let preview = create_image_preview(&img.pixel_data, PLATE_SIZE, PLATE_SIZE);
+            let base64_preview = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &preview);
+            
+            serde_json::json!({
+                "id": img.event_id,
+                "filename": img.filename,
+                "plate_x": img.target_x,
+                "plate_y": img.target_y,
+                "votes": votes,
+                "uploaded_at": img.uploaded_at,
+                "preview": format!("data:image/png;base64,{}", base64_preview)
+            })
+        })
+        .collect();
+
+    HttpResponse::Ok()
+        .content_type("application/json")
+        .json(images)
+}
+
 async fn list_images(data: web::Data<AppState>) -> impl Responder {
     let events_path = data.events_path.lock().unwrap();
     let current_week = get_current_week(&events_path);
@@ -1175,6 +1215,13 @@ async fn index() -> impl Responder {
         </div>
     </div>
 
+    <div class="section" id="votingOptionsSection" style="display: none;">
+        <h2>Röstningsalternativ för veckan</h2>
+        <p>Koordinat att uppdatera: (<span id="votingTargetX">-</span>, <span id="votingTargetY">-</span>)</p>
+        <p>Hovra över bilderna för att se hur väggen hade sett ut:</p>
+        <div class="grid" id="votingOptionsGrid"></div>
+    </div>
+
     <div class="section" id="coordSection" style="display: none;">
         <h2>Rösta på koordinat (plattor)</h2>
         <p>Klicka på en platta (27x12) för att rösta på vilken koordinat som ska uppdateras härnäst:</p>
@@ -1253,6 +1300,7 @@ async fn index() -> impl Responder {
         function updateWeekNavigation() {
             const history = window.weekHistory || [];
             const currentWeek = window.currentWeek || 0;
+            const actualWeek = parseInt(document.getElementById('week').textContent);
             
             document.getElementById('viewingWeek').textContent = currentWeek;
             
@@ -1260,7 +1308,7 @@ async fn index() -> impl Responder {
             const nextBtn = document.getElementById('nextWeek');
             
             prevBtn.disabled = currentWeek <= 0;
-            nextBtn.disabled = currentWeek >= parseInt(document.getElementById('week').textContent);
+            nextBtn.disabled = currentWeek >= actualWeek;
             
             const weekInfo = document.getElementById('weekHistoryInfo');
             const historyEntry = history.find(h => h.week === currentWeek);
@@ -1273,14 +1321,73 @@ async fn index() -> impl Responder {
                 }
                 infoText += `Nästa mål: (${historyEntry.target_x}, ${historyEntry.target_y})`;
                 weekInfo.innerHTML = infoText;
+                
+                const votingSection = document.getElementById('votingOptionsSection');
+                document.getElementById('votingTargetX').textContent = historyEntry.target_x;
+                document.getElementById('votingTargetY').textContent = historyEntry.target_y;
+                votingSection.style.display = 'block';
+                
+                loadVotingOptionsForWeek(currentWeek, historyEntry.target_x, historyEntry.target_y);
             } else if (currentWeek > 0) {
                 weekInfo.style.display = 'block';
                 weekInfo.innerHTML = `<strong>Vecka ${currentWeek}:</strong> Ingen historik tillgänglig`;
+                document.getElementById('votingOptionsSection').style.display = 'none';
             } else {
                 weekInfo.style.display = 'none';
+                document.getElementById('votingOptionsSection').style.display = 'none';
             }
             
             loadWallForWeek(currentWeek);
+        }
+        
+        async function loadVotingOptionsForWeek(week, targetX, targetY) {
+            const res = await fetch('/api/images/' + week);
+            const images = await res.json();
+            const grid = document.getElementById('votingOptionsGrid');
+            window.votingTarget = { x: targetX, y: targetY };
+            window.votingImages = images;
+            
+            if (images.length === 0) {
+                grid.innerHTML = '<p>Inga bilder uppladdade för denna vecka.</p>';
+                return;
+            }
+            
+            grid.innerHTML = images.map(img => `
+                <div class="image-card" onmouseenter="previewImageOnWallByCoords('${img.id}', ${img.plate_x}, ${img.plate_y})" onmouseleave="resetWallPreview()">
+                    <img src="${img.preview}" alt="${img.filename}">
+                    <h4>${img.filename}</h4>
+                    <p>Position: (${img.plate_x}, ${img.plate_y})</p>
+                    <p>Röster: <strong>${img.votes}</strong></p>
+                </div>
+            `).join('');
+        }
+        
+        function previewImageOnWallByCoords(imageId, plateX, plateY) {
+            const img = window.votingImages.find(i => i.id === imageId);
+            if (!img) return;
+            
+            fetch('/api/wall/' + window.currentWeek)
+                .then(r => r.json())
+                .then(data => {
+                    const imgElem = document.getElementById('wallImage');
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 810;
+                    canvas.height = 360;
+                    const ctx = canvas.getContext('2d');
+                    
+                    const wallImg = new Image();
+                    wallImg.onload = () => {
+                        ctx.drawImage(wallImg, 0, 0);
+                        
+                        const previewImg = new Image();
+                        previewImg.onload = () => {
+                            ctx.drawImage(previewImg, plateX * 30, plateY * 30);
+                            imgElem.src = canvas.toDataURL();
+                        };
+                        previewImg.src = img.preview;
+                    };
+                    wallImg.src = data.image;
+                });
         }
         
         async function loadWallForWeek(week) {
@@ -1290,10 +1397,65 @@ async fn index() -> impl Responder {
         }
 
         function prevWeek() {
-            if (window.currentWeek > 0) {
+            const history = window.weekHistory || [];
+            const currentWeek = window.currentWeek;
+            if (currentWeek > 0) {
                 window.currentWeek--;
                 updateWeekNavigation();
             }
+        }
+
+        function nextWeek() {
+            const actualWeek = parseInt(document.getElementById('week').textContent);
+            if (window.currentWeek < actualWeek) {
+                window.currentWeek++;
+                updateWeekNavigation();
+            }
+        }
+
+        async function loadWallForWeek(week) {
+            const res = await fetch('/api/wall/' + week);
+            const data = await res.json();
+            document.getElementById('wallImage').src = data.image;
+            loadCoordinateVotesForWeek(week);
+        }
+
+        async function loadCoordinateVotesForWeek(week) {
+            const nextWeek = week + 1;
+            const res = await fetch('/api/coordinates/votes');
+            const votes = await res.json();
+            const voteMap = {};
+            votes.forEach(v => { voteMap[`${v.x},${v.y}`] = v.votes; });
+            
+            let target = null;
+            const history = window.weekHistory || [];
+            const historyEntry = history.find(h => h.week === week);
+            if (historyEntry) {
+                target = { x: historyEntry.target_x, y: historyEntry.target_y };
+            } else {
+                const wallRes = await fetch('/api/wall');
+                const wallData = await wallRes.json();
+                target = wallData.current_target;
+            }
+            
+            window.currentTarget = target;
+            window.voteMap = voteMap;
+            
+            const overlay = document.getElementById('wallOverlay');
+            let html = '';
+            for (let y = 0; y < 12; y++) {
+                for (let x = 0; x < 27; x++) {
+                    const key = `${x},${y}`;
+                    const isTarget = target && target.x === x && target.y === y;
+                    const votes = voteMap[key] || 0;
+                    let classes = 'overlay-cell';
+                    if (isTarget) classes += ' current-target';
+                    if (votes > 0 && !isTarget) classes += ' has-votes';
+                    html += `<div class="${classes}" 
+                        onclick="voteCoordinate(${x}, ${y})" data-x="${x}" data-y="${y}">${votes > 0 ? votes : ''}</div>`;
+                }
+            }
+            overlay.innerHTML = html;
         }
 
         function nextWeek() {
@@ -1508,7 +1670,6 @@ async fn index() -> impl Responder {
 
         renderColorPalette();
         loadStats();
-        loadWall();
         loadImages();
         loadCoordinateVotes();
     </script>
@@ -1552,6 +1713,7 @@ async fn main() -> std::io::Result<()> {
             .route("/", web::get().to(index))
             .route("/api/wall", web::get().to(get_wall))
             .route("/api/wall/{week}", web::get().to(get_wall_for_week))
+            .route("/api/images/{week}", web::get().to(get_images_for_week))
             .route("/api/images", web::get().to(list_images))
             .route("/api/upload", web::post().to(upload_image))
             .route("/api/vote", web::post().to(vote_image))
