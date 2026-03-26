@@ -1200,7 +1200,7 @@ async fn index() -> impl Responder {
         <div class="coord-grid" id="coordGrid"></div>
     </div>
 
-    <div class="section">
+    <div class="section" id="currentWeekVotingSection">
         <h2>Rösta på bild</h2>
         <p>Välj vilken bild som ska läggas upp på den valda koordinaten:</p>
         <div class="grid" id="imageGrid"></div>
@@ -1285,7 +1285,15 @@ async fn index() -> impl Responder {
             const weekInfo = document.getElementById('weekHistoryInfo');
             const historyEntry = history.find(h => h.week === currentWeek);
             
-            if (historyEntry) {
+            const currentWeekVotingSection = document.getElementById('currentWeekVotingSection');
+            const votingSection = document.getElementById('votingOptionsSection');
+            
+            if (currentWeek === actualWeek) {
+                currentWeekVotingSection.style.display = 'block';
+                votingSection.style.display = 'none';
+            } else if (historyEntry) {
+                currentWeekVotingSection.style.display = 'none';
+                
                 weekInfo.style.display = 'block';
                 let infoText = `<strong>Vecka ${historyEntry.week}:</strong> `;
                 if (historyEntry.applied_x !== undefined) {
@@ -1294,19 +1302,20 @@ async fn index() -> impl Responder {
                 infoText += `Nästa mål: (${historyEntry.target_x}, ${historyEntry.target_y})`;
                 weekInfo.innerHTML = infoText;
                 
-                const votingSection = document.getElementById('votingOptionsSection');
                 document.getElementById('votingTargetX').textContent = historyEntry.target_x;
                 document.getElementById('votingTargetY').textContent = historyEntry.target_y;
                 votingSection.style.display = 'block';
                 
                 loadVotingOptionsForWeek(currentWeek, historyEntry.target_x, historyEntry.target_y);
             } else if (currentWeek > 0) {
+                currentWeekVotingSection.style.display = 'none';
                 weekInfo.style.display = 'block';
                 weekInfo.innerHTML = `<strong>Vecka ${currentWeek}:</strong> Ingen historik tillgänglig`;
-                document.getElementById('votingOptionsSection').style.display = 'none';
+                votingSection.style.display = 'none';
             } else {
+                currentWeekVotingSection.style.display = 'block';
                 weekInfo.style.display = 'none';
-                document.getElementById('votingOptionsSection').style.display = 'none';
+                votingSection.style.display = 'none';
             }
             
             loadWallForWeek(currentWeek);
