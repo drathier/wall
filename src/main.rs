@@ -1182,6 +1182,12 @@ async fn index() -> impl Responder {
     </div>
 
     <div class="section">
+        <h2>Rösta på bild</h2>
+        <p>Välj vilken bild som ska läggas upp på den valda koordinaten:</p>
+        <div class="grid" id="imageGrid"></div>
+    </div>
+
+    <div class="section">
         <h2>Ladda upp bild</h2>
         <form id="uploadForm" enctype="multipart/form-data">
             <input type="file" name="file" accept=".bmp,.png" required>
@@ -1189,12 +1195,6 @@ async fn index() -> impl Responder {
             <input type="submit" value="Ladda upp">
         </form>
         <div id="uploadResult"></div>
-    </div>
-
-    <div class="section">
-        <h2>Rösta på bild</h2>
-        <p>Välj vilken bild som ska läggas upp på den valda koordinaten:</p>
-        <div class="grid" id="imageGrid"></div>
     </div>
 
     <div class="section">
@@ -1315,13 +1315,15 @@ async fn index() -> impl Responder {
             const images = await res.json();
             const grid = document.getElementById('imageGrid');
             
+            window.availableImages = images;
+            
             if (images.length === 0) {
                 grid.innerHTML = '<p>Inga bilder uppladdade ännu.</p>';
                 return;
             }
             
             grid.innerHTML = images.map(img => `
-                <div class="image-card">
+                <div class="image-card" onmouseenter="previewImageOnWall('${img.id}')" onmouseleave="resetWallPreview()">
                     <img src="${img.preview}" alt="${img.filename}">
                     <h4>${img.filename}</h4>
                     <p>Position: (${img.plate_x}, ${img.plate_y})</p>
@@ -1329,6 +1331,39 @@ async fn index() -> impl Responder {
                     <button class="vote-btn" onclick="voteImage('${img.id}')">Rösta</button>
                 </div>
             `).join('');
+        }
+        
+        function previewImageOnWall(imageId) {
+            const img = window.availableImages.find(i => i.id === imageId);
+            if (!img || !window.currentTarget) return;
+            
+            const target = window.currentTarget;
+            fetch('/api/wall/' + window.currentWeek)
+                .then(r => r.json())
+                .then(data => {
+                    const imgElem = document.getElementById('wallImage');
+                    const canvas = document.createElement('canvas');
+                    canvas.width = 810;
+                    canvas.height = 360;
+                    const ctx = canvas.getContext('2d');
+                    
+                    const wallImg = new Image();
+                    wallImg.onload = () => {
+                        ctx.drawImage(wallImg, 0, 0);
+                        
+                        const previewImg = new Image();
+                        previewImg.onload = () => {
+                            ctx.drawImage(previewImg, target.x * 30, target.y * 30);
+                            imgElem.src = canvas.toDataURL();
+                        };
+                        previewImg.src = img.preview;
+                    };
+                    wallImg.src = data.image;
+                });
+        }
+        
+        function resetWallPreview() {
+            loadWallForWeek(window.currentWeek);
         }
 
         async function loadCoordinateVotes() {
