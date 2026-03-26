@@ -343,32 +343,22 @@ fn render_wall_preview_for_week(events_path: &str, target_week: u32) -> Vec<u8> 
     for ty in 0..WALL_HEIGHT_PLATES as i32 {
         for tx in 0..WALL_WIDTH_PLATES as i32 {
             if let Some(tile_data) = tiles.get(&(tx, ty)) {
-                for py in 0..PLATE_SIZE {
-                    for px in 0..PLATE_SIZE {
-                        let tile_pixel_idx = ((py * PLATE_SIZE + px) * 3) as usize;
-                        let wall_pixel_idx = (((ty * PLATE_SIZE as i32 + py as i32) * TOTAL_WIDTH as i32 
-                            + (tx * PLATE_SIZE as i32 + px as i32)) * 3) as usize;
-                        
-                        if tile_pixel_idx + 2 < tile_data.len() && wall_pixel_idx + 2 < pixels.len() {
-                            pixels[wall_pixel_idx] = tile_data[tile_pixel_idx];
-                            pixels[wall_pixel_idx + 1] = tile_data[tile_pixel_idx + 1];
-                            pixels[wall_pixel_idx + 2] = tile_data[tile_pixel_idx + 2];
-                        }
+                let ty = ty as usize;
+                let tx = tx as usize;
+                let row_size = (PLATE_SIZE * 3) as usize;
+                for py in 0..PLATE_SIZE as usize {
+                    let src_offset = py * row_size;
+                    let dest_offset = ((ty * PLATE_SIZE as usize + py) * TOTAL_WIDTH as usize + (tx * PLATE_SIZE as usize)) * 3;
+                    let copy_len = row_size.min(pixels.len().saturating_sub(dest_offset));
+                    if copy_len > 0 && src_offset + copy_len <= tile_data.len() {
+                        pixels[dest_offset..dest_offset + copy_len].copy_from_slice(&tile_data[src_offset..src_offset + copy_len]);
                     }
                 }
             }
         }
     }
     
-    let mut img = image::RgbImage::new(TOTAL_WIDTH, TOTAL_HEIGHT);
-    
-    for (i, chunk) in pixels.chunks(3).enumerate() {
-        let x = (i as u32) % TOTAL_WIDTH;
-        let y = (i as u32) / TOTAL_WIDTH;
-        if chunk.len() == 3 {
-            img.put_pixel(x, y, image::Rgb([chunk[0], chunk[1], chunk[2]]));
-        }
-    }
+    let img = image::RgbImage::from_raw(TOTAL_WIDTH, TOTAL_HEIGHT, pixels).expect("Failed to create image");
 
     let mut buf = Vec::new();
     img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
@@ -392,32 +382,22 @@ fn render_wall_preview(events_path: &str) -> Vec<u8> {
     for ty in 0..WALL_HEIGHT_PLATES as i32 {
         for tx in 0..WALL_WIDTH_PLATES as i32 {
             if let Some(tile_data) = tiles.get(&(tx, ty)) {
-                for py in 0..PLATE_SIZE {
-                    for px in 0..PLATE_SIZE {
-                        let tile_pixel_idx = ((py * PLATE_SIZE + px) * 3) as usize;
-                        let wall_pixel_idx = (((ty * PLATE_SIZE as i32 + py as i32) * TOTAL_WIDTH as i32 
-                            + (tx * PLATE_SIZE as i32 + px as i32)) * 3) as usize;
-                        
-                        if tile_pixel_idx + 2 < tile_data.len() && wall_pixel_idx + 2 < pixels.len() {
-                            pixels[wall_pixel_idx] = tile_data[tile_pixel_idx];
-                            pixels[wall_pixel_idx + 1] = tile_data[tile_pixel_idx + 1];
-                            pixels[wall_pixel_idx + 2] = tile_data[tile_pixel_idx + 2];
-                        }
+                let ty = ty as usize;
+                let tx = tx as usize;
+                let row_size = (PLATE_SIZE * 3) as usize;
+                for py in 0..PLATE_SIZE as usize {
+                    let src_offset = py * row_size;
+                    let dest_offset = ((ty * PLATE_SIZE as usize + py) * TOTAL_WIDTH as usize + (tx * PLATE_SIZE as usize)) * 3;
+                    let copy_len = row_size.min(pixels.len().saturating_sub(dest_offset));
+                    if copy_len > 0 && src_offset + copy_len <= tile_data.len() {
+                        pixels[dest_offset..dest_offset + copy_len].copy_from_slice(&tile_data[src_offset..src_offset + copy_len]);
                     }
                 }
             }
         }
     }
     
-    let mut img = image::RgbImage::new(TOTAL_WIDTH, TOTAL_HEIGHT);
-    
-    for (i, chunk) in pixels.chunks(3).enumerate() {
-        let x = (i as u32) % TOTAL_WIDTH;
-        let y = (i as u32) / TOTAL_WIDTH;
-        if chunk.len() == 3 {
-            img.put_pixel(x, y, image::Rgb([chunk[0], chunk[1], chunk[2]]));
-        }
-    }
+    let img = image::RgbImage::from_raw(TOTAL_WIDTH, TOTAL_HEIGHT, pixels).expect("Failed to create image");
 
     let mut buf = Vec::new();
     img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
@@ -567,15 +547,7 @@ fn create_image_preview(pixel_data: &[u8], width: u32, height: u32) -> Vec<u8> {
         return Vec::new();
     }
 
-    let mut img = image::RgbImage::new(width, height);
-    
-    for (i, chunk) in pixel_data.chunks(3).enumerate() {
-        let x = (i as u32) % width;
-        let y = (i as u32) / width;
-        if chunk.len() == 3 {
-            img.put_pixel(x, y, image::Rgb([chunk[0], chunk[1], chunk[2]]));
-        }
-    }
+    let img = image::RgbImage::from_raw(width, height, pixel_data.to_vec()).expect("Failed to create image");
 
     let mut buf = Vec::new();
     let _ = img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png);
