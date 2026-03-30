@@ -306,15 +306,20 @@ fn get_wall_tiles_for_week(events_path: &str, target_week: u32) -> HashMap<(i32,
 }
 
 fn render_wall_preview_for_week(events_path: &str, target_week: u32) -> Vec<u8> {
+    let t_start = std::time::Instant::now();
+    
     let row_bytes = (TOTAL_WIDTH * 3) as usize;
     let plate_row_bytes = (PLATE_SIZE * 3) as usize;
     
+    let t_palette_start = std::time::Instant::now();
     let colors: Vec<(u8, u8, u8)> = APPROVED_COLORS
         .iter()
         .map(|(_, r, g, b)| (*r, *g, *b))
         .collect();
     let num_colors = colors.len() as i32;
+    let t_palette = t_palette_start.elapsed();
     
+    let t_default_start = std::time::Instant::now();
     let mut pixels = Vec::with_capacity((TOTAL_WIDTH * TOTAL_HEIGHT * 3) as usize);
     for py in 0..TOTAL_HEIGHT as i32 {
         for px in 0..TOTAL_WIDTH as i32 {
@@ -327,18 +332,24 @@ fn render_wall_preview_for_week(events_path: &str, target_week: u32) -> Vec<u8> 
             pixels.push(b);
         }
     }
+    let t_default = t_default_start.elapsed();
     
+    let t_read_week_start = std::time::Instant::now();
     let week_events: Vec<WeekAdvancedEvent> = get_events_by_type::<WeekAdvancedEvent>(events_path, "week_advanced")
         .into_iter()
         .map(|(_, e)| e)
         .filter(|e| e.to_week <= target_week)
         .collect();
+    let t_read_week = t_read_week_start.elapsed();
     
+    let t_read_image_start = std::time::Instant::now();
     let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type::<ImageUploadedEvent>(events_path, "image_uploaded")
         .into_iter()
         .map(|(_, e)| (e.event_id.clone(), e))
         .collect();
+    let t_read_image = t_read_image_start.elapsed();
     
+    let t_overlay_start = std::time::Instant::now();
     for event in &week_events {
         if event.applied_x >= 0 && event.applied_y >= 0 {
             if let Some(img_event_id) = &event.winning_image_event_id {
@@ -355,11 +366,22 @@ fn render_wall_preview_for_week(events_path: &str, target_week: u32) -> Vec<u8> 
             }
         }
     }
+    let t_overlay = t_overlay_start.elapsed();
     
+    let t_create_img_start = std::time::Instant::now();
     let img = image::RgbImage::from_raw(TOTAL_WIDTH, TOTAL_HEIGHT, pixels).expect("Failed to create image");
+    let t_create_img = t_create_img_start.elapsed();
 
+    let t_encode_start = std::time::Instant::now();
     let mut buf = Vec::new();
     img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+    let t_encode = t_encode_start.elapsed();
+    
+    let total = t_start.elapsed();
+    let t_read_total = t_read_week + t_read_image;
+    println!("[TIMING] render_wall_preview_for_week({}): total={:?}, read_total={:?}, read_week={:?}, read_image={:?}, palette={:?}, default_pixels={:?}, overlay={:?}, create_img={:?}, png_encode={:?}", 
+        target_week, total, t_read_total, t_read_week, t_read_image, t_palette, t_default, t_overlay, t_create_img, t_encode);
+    
     buf
 }
 
@@ -373,15 +395,34 @@ fn get_coordinate_votes_for_week(events_path: &str, week: u32) -> Vec<Coordinate
 }
 
 fn render_wall_preview(events_path: &str) -> Vec<u8> {
+    let t_start = std::time::Instant::now();
+    
     let row_bytes = (TOTAL_WIDTH * 3) as usize;
     let plate_row_bytes = (PLATE_SIZE * 3) as usize;
     
+    let t_read_week_start = std::time::Instant::now();
+    let week_events: Vec<WeekAdvancedEvent> = get_events_by_type(events_path, "week_advanced")
+        .into_iter()
+        .map(|(_, e)| e)
+        .collect();
+    let t_read_week = t_read_week_start.elapsed();
+    
+    let t_read_image_start = std::time::Instant::now();
+    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type::<ImageUploadedEvent>(events_path, "image_uploaded")
+        .into_iter()
+        .map(|(_, e)| (e.event_id.clone(), e))
+        .collect();
+    let t_read_image = t_read_image_start.elapsed();
+    
+    let t_palette_start = std::time::Instant::now();
     let colors: Vec<(u8, u8, u8)> = APPROVED_COLORS
         .iter()
         .map(|(_, r, g, b)| (*r, *g, *b))
         .collect();
     let num_colors = colors.len() as i32;
+    let t_palette = t_palette_start.elapsed();
     
+    let t_default_start = std::time::Instant::now();
     let mut pixels = Vec::with_capacity((TOTAL_WIDTH * TOTAL_HEIGHT * 3) as usize);
     for py in 0..TOTAL_HEIGHT as i32 {
         for px in 0..TOTAL_WIDTH as i32 {
@@ -394,17 +435,9 @@ fn render_wall_preview(events_path: &str) -> Vec<u8> {
             pixels.push(b);
         }
     }
+    let t_default = t_default_start.elapsed();
     
-    let week_events: Vec<WeekAdvancedEvent> = get_events_by_type(events_path, "week_advanced")
-        .into_iter()
-        .map(|(_, e)| e)
-        .collect();
-    
-    let image_events: HashMap<String, ImageUploadedEvent> = get_events_by_type::<ImageUploadedEvent>(events_path, "image_uploaded")
-        .into_iter()
-        .map(|(_, e)| (e.event_id.clone(), e))
-        .collect();
-    
+    let t_overlay_start = std::time::Instant::now();
     for event in &week_events {
         if event.applied_x >= 0 && event.applied_y >= 0 {
             if let Some(img_event_id) = &event.winning_image_event_id {
@@ -421,19 +454,37 @@ fn render_wall_preview(events_path: &str) -> Vec<u8> {
             }
         }
     }
+    let t_overlay = t_overlay_start.elapsed();
     
+    let t_create_img_start = std::time::Instant::now();
     let img = image::RgbImage::from_raw(TOTAL_WIDTH, TOTAL_HEIGHT, pixels).expect("Failed to create image");
-
+    let t_create_img = t_create_img_start.elapsed();
+    
+    let t_encode_start = std::time::Instant::now();
     let mut buf = Vec::new();
     img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).unwrap();
+    let t_encode = t_encode_start.elapsed();
+    
+    let total = t_start.elapsed();
+    let t_read_total = t_read_week + t_read_image;
+    println!("[TIMING] render_wall_preview: total={:?}, read_total={:?}, read_week={:?}, read_image={:?}, palette={:?}, default_pixels={:?}, overlay={:?}, create_img={:?}, png_encode={:?}", 
+        total, t_read_total, t_read_week, t_read_image, t_palette, t_default, t_overlay, t_create_img, t_encode);
+    
     buf
 }
 
 async fn get_wall(data: web::Data<AppState>) -> impl Responder {
+    let t_start = std::time::Instant::now();
+    
     let events_path = data.events_path.lock().unwrap();
     
+    let t_render_start = std::time::Instant::now();
     let png_data = render_wall_preview(&events_path);
+    let t_render = t_render_start.elapsed();
+    
+    let t_base64_start = std::time::Instant::now();
     let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
+    let t_base64 = t_base64_start.elapsed();
     
     let current_target = get_current_target(&events_path);
     
@@ -450,17 +501,27 @@ async fn get_wall(data: web::Data<AppState>) -> impl Responder {
         }
     });
     
+    let total = t_start.elapsed();
+    println!("[TIMING] get_wall: total={:?}, render={:?}, base64={:?}", total, t_render, t_base64);
+    
     HttpResponse::Ok()
         .content_type("application/json")
         .json(json_state)
 }
 
 async fn get_wall_for_week(data: web::Data<AppState>, week: web::Path<u32>) -> impl Responder {
+    let t_start = std::time::Instant::now();
+    
     let events_path = data.events_path.lock().unwrap();
     let target_week = *week;
     
+    let t_render_start = std::time::Instant::now();
     let png_data = render_wall_preview_for_week(&events_path, target_week);
+    let t_render = t_render_start.elapsed();
+    
+    let t_base64_start = std::time::Instant::now();
     let base64_data = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
+    let t_base64 = t_base64_start.elapsed();
     
     let json_state = serde_json::json!({
         "week": target_week,
@@ -474,12 +535,17 @@ async fn get_wall_for_week(data: web::Data<AppState>, week: web::Path<u32>) -> i
         }
     });
     
+    let total = t_start.elapsed();
+    println!("[TIMING] get_wall_for_week: total={:?}, render={:?}, base64={:?}", total, t_render, t_base64);
+    
     HttpResponse::Ok()
         .content_type("application/json")
         .json(json_state)
 }
 
 async fn get_images_for_week(data: web::Data<AppState>, week: web::Path<u32>) -> impl Responder {
+    let t_start = std::time::Instant::now();
+    
     let events_path = data.events_path.lock().unwrap();
     let target_week = *week;
     
@@ -495,6 +561,7 @@ async fn get_images_for_week(data: web::Data<AppState>, week: web::Path<u32>) ->
         *vote_counts.entry(vote.image_event_id.clone()).or_insert(0) += 1;
     }
     
+    let t_build_start = std::time::Instant::now();
     let images: Vec<Value> = image_events
         .into_iter()
         .map(|img| {
@@ -513,13 +580,19 @@ async fn get_images_for_week(data: web::Data<AppState>, week: web::Path<u32>) ->
             })
         })
         .collect();
+    let t_build = t_build_start.elapsed();
 
+    let total = t_start.elapsed();
+    println!("[TIMING] get_images_for_week: total={:?}, build={:?}", total, t_build);
+    
     HttpResponse::Ok()
         .content_type("application/json")
         .json(images)
 }
 
 async fn list_images(data: web::Data<AppState>) -> impl Responder {
+    let t_start = std::time::Instant::now();
+    
     let events_path = data.events_path.lock().unwrap();
     let current_week = get_current_week(&events_path);
     
@@ -535,6 +608,7 @@ async fn list_images(data: web::Data<AppState>) -> impl Responder {
         *vote_counts.entry(vote.image_event_id.clone()).or_insert(0) += 1;
     }
     
+    let t_build_start = std::time::Instant::now();
     let images: Vec<Value> = image_events
         .into_iter()
         .map(|img| {
@@ -553,7 +627,11 @@ async fn list_images(data: web::Data<AppState>) -> impl Responder {
             })
         })
         .collect();
+    let t_build = t_build_start.elapsed();
 
+    let total = t_start.elapsed();
+    println!("[TIMING] list_images: total={:?}, build={:?}", total, t_build);
+    
     HttpResponse::Ok()
         .content_type("application/json")
         .json(images)
@@ -1716,4 +1794,3 @@ async fn main() -> std::io::Result<()> {
     .run()
     .await
 }
-
